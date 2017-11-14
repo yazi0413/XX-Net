@@ -77,7 +77,6 @@ from appids_manager import appid_manager
 
 from config import config
 from google_ip import google_ip
-import check_local_network
 from http_dispatcher import http_dispatch
 from http_common import *
 
@@ -199,8 +198,8 @@ def request_gae_server(headers, body, url, timeout):
         raise GAE_Exception(
             response.status, "fetch gae fail:%d" % response.status)
 
-    server_type = response.headers.get("server", "")
-    content_type = response.headers.get("content-type", "")
+    server_type = response.getheader("server", "")
+    # content_type = response.getheaders("content-type", "")
     if ("gws" not in server_type and "Google Frontend" not in server_type and "GFE" not in server_type) or \
             response.status == 403 or response.status == 405:
 
@@ -208,7 +207,7 @@ def request_gae_server(headers, body, url, timeout):
         # but can't use as GAE server
         # so we need remove it immediately
 
-        xlog.warn("IP:%s not support GAE, server:%s status:%d", response.ssl_sock.ip, server_type,
+        xlog.warn("IP:%s not support GAE, headers:%s status:%d", response.ssl_sock.ip, response.headers,
                   response.status)
         google_ip.recheck_ip(response.ssl_sock.ip)
         response.worker.close("ip not support GAE")
@@ -336,8 +335,6 @@ def request_gae_proxy(method, url, headers, body, timeout=60, retry=True):
 
         try:
             response = request_gae_server(request_headers, request_body, url, timeout)
-
-            check_local_network.report_network_ok()
 
             response = unpack_response(response)
 

@@ -61,6 +61,7 @@ if sys.platform == "win32":
     win32_lib = os.path.abspath( os.path.join(python_path, 'lib', 'win32'))
     sys.path.append(win32_lib)
 
+from base64 import b64encode
 import socket
 import struct
 from errno import EOPNOTSUPP, EINVAL, EAGAIN
@@ -123,6 +124,7 @@ DEFAULT_PORTS = { SOCKS4: 1080,
                   HTTP: 8080
                 }
 
+
 def set_default_proxy(proxy_type=None, addr=None, port=None, rdns=True, username=None, password=None):
     """
     set_default_proxy(proxy_type, addr[, port[, rdns[, username, password]]])
@@ -130,6 +132,17 @@ def set_default_proxy(proxy_type=None, addr=None, port=None, rdns=True, username
     Sets a default proxy which all further socksocket objects will use,
     unless explicitly changed. All parameters are as for socket.set_proxy().
     """
+    if isinstance(proxy_type, basestring):
+        proxy_type = proxy_type.lower()
+        if "http" in proxy_type:
+            proxy_type = PROXY_TYPE_HTTP
+        elif "socks5" in proxy_type:
+            proxy_type = PROXY_TYPE_SOCKS5
+        elif "socks4" in proxy_type:
+            proxy_type = PROXY_TYPE_SOCKS4
+        else:
+            raise ProxyError("unknown proxy type:%s" % proxy_type)
+
     socksocket.default_proxy = (proxy_type, addr, port, rdns,
                                 username.encode() if username else None,
                                 password.encode() if password else None)
@@ -269,6 +282,17 @@ class socksocket(_BaseSocket):
         password -    Password to authenticate with to the server.
                        Only relevant when username is also provided.
         """
+        if isinstance(proxy_type, basestring):
+            proxy_type = proxy_type.lower()
+            if "http" in proxy_type:
+                proxy_type = PROXY_TYPE_HTTP
+            elif "socks5" in proxy_type:
+                proxy_type = PROXY_TYPE_SOCKS5
+            elif "socks4" in proxy_type:
+                proxy_type = PROXY_TYPE_SOCKS4
+            else:
+                raise ProxyError("unknown proxy type:%s" % proxy_type)
+
         self.proxy = (proxy_type, addr, port, rdns,
                       username.encode() if username else None,
                       password.encode() if password else None)
@@ -592,8 +616,19 @@ class socksocket(_BaseSocket):
         # If we need to resolve locally, we do this now
         addr = dest_addr if rdns else socket.gethostbyname(dest_addr)
 
-        self.sendall(b"CONNECT " + addr.encode('idna') + b":" + str(dest_port).encode() +
-                     b" HTTP/1.1\r\n" + b"Host: " + dest_addr.encode('idna') + b"\r\n\r\n")
+        http_headers = [
+            (b"CONNECT " + addr.encode("idna") + b":"
+             + str(dest_port).encode() + b" HTTP/1.1"),
+            b"Host: " + dest_addr.encode("idna")
+        ]
+
+        if username and password:
+            http_headers.append(b"Proxy-Authorization: basic "
+                                + b64encode(username + b":" + password))
+
+        http_headers.append(b"\r\n")
+
+        self.sendall(b"\r\n".join(http_headers))
 
         # We just need the first line to check if the connection was successful
         fobj = self.makefile()
@@ -640,9 +675,16 @@ class socksocket(_BaseSocket):
         Uses the same API as socket's connect().
         To select the proxy server, use set_proxy().
 
-        dest_pair - 2-tuple of (IP/hostname, port).
+        dest_pair
         """
-        dest_addr, dest_port = dest_pair
+        if len(dest_pair) == 2:
+            # IPv4
+            dest_addr, dest_port = dest_pair
+        elif len(dest_pair) == 4:
+            # IPv6
+            dest_addr, dest_port, st_zero, st_stream  = dest_pair
+        else:
+            raise GeneralProxyError("Invalid destination-connection (host, port) pair")
 
         if self.type == socket.SOCK_DGRAM:
             if not self._proxyconn:
@@ -660,10 +702,7 @@ class socksocket(_BaseSocket):
         proxy_type, proxy_addr, proxy_port, rdns, username, password = self.proxy
 
         # Do a minimal input check first
-        if (not isinstance(dest_pair, (list, tuple))
-                or len(dest_pair) != 2
-                or not dest_addr
-                or not isinstance(dest_port, int)):
+        if not dest_addr or not isinstance(dest_port, int):
             raise GeneralProxyError("Invalid destination-connection (host, port) pair")
 
 

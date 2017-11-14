@@ -10,17 +10,18 @@ import os
 import re
 import subprocess
 import cgi
-import urllib2
 import sys
 import datetime
 import locale
 import time
 import hashlib
+import ConfigParser
 
+
+import yaml
+import simple_http_server
 
 from xlog import getLogger
-
-
 xlog = getLogger("gae_proxy")
 from config import config
 from appids_manager import appid_manager
@@ -28,26 +29,24 @@ from google_ip import google_ip
 from google_ip_range import ip_range
 from connect_manager import https_manager
 from scan_ip_log import scan_ip_log
-import ConfigParser
 import connect_control
 import ip_utils
 import check_local_network
 import check_ip
 import cert_util
-import simple_http_server
 import test_appid
 from http_dispatcher import http_dispatch
 import openssl_wrap
+import ipv6_tunnel
 
 
 os.environ['HTTPS_PROXY'] = ''
 current_path = os.path.dirname(os.path.abspath(__file__))
+
 root_path = os.path.abspath(os.path.join(current_path, os.pardir, os.pardir))
 top_path = os.path.abspath(os.path.join(root_path, os.pardir, os.pardir))
+data_path = os.path.abspath( os.path.join(top_path, 'data', 'gae_proxy'))
 web_ui_path = os.path.join(current_path, os.path.pardir, "web_ui")
-
-
-import yaml
 
 
 class User_special(object):
@@ -65,7 +64,8 @@ class User_special(object):
         self.host_appengine_mode = "gae"
         self.auto_adjust_scan_ip_thread_num = 1
         self.scan_ip_thread_num = 0
-        self.use_ipv6 = 0
+        self.use_ipv6 = "auto"
+
 
 class User_config(object):
     user_special = User_special()
@@ -81,7 +81,7 @@ class User_config(object):
 
 
         self.USER_CONFIG = ConfigParser.ConfigParser()
-        CONFIG_USER_FILENAME = os.path.abspath( os.path.join(top_path, 'data', 'gae_proxy', 'config.ini'))
+        CONFIG_USER_FILENAME = os.path.join(data_path, 'config.ini')
 
         try:
             if os.path.isfile(DEFAULT_CONFIG_FILENAME):
@@ -117,7 +117,9 @@ class User_config(object):
                 pass
 
             try:
-                self.user_special.use_ipv6 = config.CONFIG.getint('google_ip', 'use_ipv6')
+                self.user_special.use_ipv6 = config.CONFIG.get('google_ip', 'use_ipv6')
+                if self.user_special.use_ipv6 not in ["auto", "force_ipv4", "force_ipv6"]:
+                    self.user_special.use_ipv6 = "auto"
             except:
                 pass
 
@@ -132,7 +134,7 @@ class User_config(object):
             xlog.warn("User_config.load except:%s", e)
 
     def save(self):
-        CONFIG_USER_FILENAME = os.path.abspath( os.path.join(top_path, 'data', 'gae_proxy', 'config.ini'))
+        CONFIG_USER_FILENAME = os.path.join(data_path, 'config.ini')
         try:
             f = open(CONFIG_USER_FILENAME, 'w')
             if self.user_special.appid != "":
@@ -162,12 +164,12 @@ class User_config(object):
             if int(self.user_special.scan_ip_thread_num) != self.DEFAULT_CONFIG.getint('google_ip', 'max_scan_ip_thread_num'):
                 f.write("max_scan_ip_thread_num = %d\n\n" % int(self.user_special.scan_ip_thread_num))
 
-            if int(self.user_special.use_ipv6) != self.DEFAULT_CONFIG.getint('google_ip', 'use_ipv6'):
-                f.write("use_ipv6 = %d\n\n" % int(self.user_special.use_ipv6))
+            if self.user_special.use_ipv6 != self.DEFAULT_CONFIG.get('google_ip', 'use_ipv6'):
+                f.write("use_ipv6 = %s\n\n" % self.user_special.use_ipv6)
 
             f.close()
-        except:
-            xlog.warn("launcher.config save user config fail:%s", CONFIG_USER_FILENAME)
+        except Exception as e:
+            xlog.warn("launcher.config save user config fail:%s %r", CONFIG_USER_FILENAME, e)
 
 
 user_config = User_config()
@@ -178,14 +180,6 @@ def get_openssl_version():
                            openssl_wrap.ssl_version,
                            openssl_wrap.support_alpn_npn)
 
-def http_request(url, method="GET"):
-    proxy_handler = urllib2.ProxyHandler({})
-    opener = urllib2.build_opener(proxy_handler)
-    try:
-        req = opener.open(url)
-    except Exception as e:
-        xlog.exception("web_control http_request:%s fail:%s", url, e)
-    return
 
 deploy_proc = None
 
@@ -234,6 +228,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             return self.req_check_ip_handler()
         elif path == "/debug":
             return self.req_debug_handler()
+        elif path.startswith("/ipv6_tunnel"):
+            return self.req_ipv6_tunnel_handler()
         elif path == "/quit":
             connect_control.keep_running = False
             data = "Quit"
@@ -407,10 +403,6 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         else:
             user_agent = ""
 
-        good_ip_num = google_ip.good_ip_num
-        if good_ip_num > len(google_ip.gws_ip_list):
-            good_ip_num = len(google_ip.gws_ip_list)
-
         res_arr = {
                    "sys_platform": "%s, %s" % (platform.machine(), platform.platform()),
                    "os_system": platform.system(),
@@ -426,16 +418,19 @@ class ControlHandler(simple_http_server.HttpServerHandler):
 
                    "proxy_listen": config.LISTEN_IP + ":" + str(config.LISTEN_PORT),
                    "pac_url": config.pac_url,
-                   "use_ipv6": config.CONFIG.getint("google_ip", "use_ipv6"),
+                   "use_ipv6": config.USE_IPV6,
 
                    "gae_appid": "|".join(config.GAE_APPIDS),
                    "working_appid": "|".join(appid_manager.working_appid_list),
                    "out_of_quota_appids": "|".join(appid_manager.out_of_quota_appids),
                    "not_exist_appids": "|".join(appid_manager.not_exist_appids),
 
-                   "network_state": check_local_network.network_stat,
+                   "ipv4_state": check_local_network.IPv4.get_stat(),
+                   "ipv6_state": check_local_network.IPv6.get_stat(),
+                   "ipv6_tunnel": ipv6_tunnel.state(),
                    "ip_num": len(google_ip.gws_ip_list),
-                   "good_ip_num": good_ip_num,
+                   "good_ipv4_num": google_ip.good_ipv4_num,
+                   "good_ipv6_num": google_ip.good_ipv6_num,
                    "connected_link_new": len(https_manager.new_conn_pool.pool),
                    "connected_link_used": len(https_manager.gae_conn_pool.pool),
                    "worker_h1": http_dispatch.h1_num,
@@ -466,7 +461,7 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             elif reqs['cmd'] == ['set_config']:
                 appids = self.postvars['appid'][0]
                 if appids != user_config.user_special.appid:
-                    if appids and google_ip.good_ip_num:
+                    if appids and (google_ip.good_ipv4_num + google_ip.good_ipv6_num):
                         fail_appid_list = test_appid.test_appids(appids)
                         if len(fail_appid_list):
                             fail_appid = "|".join(fail_appid_list)
@@ -488,21 +483,11 @@ class ControlHandler(simple_http_server.HttpServerHandler):
                 user_config.user_special.proxy_passwd = self.postvars['proxy_passwd'][0]
                 user_config.user_special.host_appengine_mode = self.postvars['host_appengine_mode'][0]
 
-                use_ipv6 = int(self.postvars['use_ipv6'][0])
-                if user_config.user_special.use_ipv6 != use_ipv6:
-                    if use_ipv6:
-                        if not check_local_network.check_ipv6() and False:
-                            xlog.warn("IPv6 was enabled, but check failed.")
-                            return self.send_response_nc('text/html', '{"res":"fail", "reason":"IPv6 fail"}')
-
-                    user_config.user_special.use_ipv6 = use_ipv6
-
                 user_config.save()
 
                 config.load()
                 appid_manager.reset_appid()
                 import connect_manager
-                connect_manager.load_proxy_config()
                 connect_manager.https_manager.load_config()
                 if appid_updated:
                     http_dispatch.close_all_worker()
@@ -518,7 +503,6 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             xlog.exception("req_config_handler except:%s", e)
             data = '{"res":"fail", "except":"%s"}' % e
         self.send_response_nc('text/html', data)
-
 
     def req_deploy_handler(self):
         global deploy_proc
@@ -588,7 +572,7 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             ip_list = self.postvars['ipList'][0]
             addresses = ip_list.split('|')
             for ip in addresses:
-                if not ip_utils.check_ip_valid(ip):
+                if not ip_utils.check_ip_valid(ip) and not ip_utils.check_ip_valid6(ip):
                     continue
                 if google_ip.add_ip(ip, 100, "google.com", "gws"):
                     count += 1
@@ -710,10 +694,16 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             should_auto_adjust_scan_ip = int(self.postvars['auto_adjust_scan_ip_thread_num'][0])
             thread_num_for_scan_ip = int(self.postvars['scan_ip_thread_num'][0])
 
+            use_ipv6 = self.postvars['use_ipv6'][0]
+            if user_config.user_special.use_ipv6 != use_ipv6:
+                xlog.debug("use_ipv6 change to %s", use_ipv6)
+                user_config.user_special.use_ipv6 = use_ipv6
+
             #update user config settings
             user_config.user_special.auto_adjust_scan_ip_thread_num = should_auto_adjust_scan_ip
             user_config.user_special.scan_ip_thread_num = thread_num_for_scan_ip
             user_config.save()
+            config.load()
 
             #update google_ip settings
             google_ip.auto_adjust_scan_ip_thread_num = should_auto_adjust_scan_ip
@@ -772,7 +762,7 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         if reqs['cmd'] == ['get_process']:
             all_ip_num = len(google_ip.ip_dict)
             left_num = google_ip.scan_exist_ip_queue.qsize()
-            good_num = google_ip.good_ip_num
+            good_num = (google_ip.good_ipv4_num + google_ip.good_ipv6_num)
             data = json.dumps(dict(all_ip_num=all_ip_num, left_num=left_num, good_num=good_num))
             self.send_response_nc('text/plain', data)
         elif reqs['cmd'] == ['start']:
@@ -803,3 +793,44 @@ class ControlHandler(simple_http_server.HttpServerHandler):
 
         mimetype = 'text/plain'
         self.send_response_nc(mimetype, data)
+
+    def req_ipv6_tunnel_handler(self):
+        req = urlparse.urlparse(self.path).query
+        reqs = urlparse.parse_qs(req, keep_blank_values=True)
+        data = ''
+
+        log_path = os.path.join(data_path, "ipv6_tunnel.log")
+        time_now = datetime.datetime.today().strftime('%H:%M:%S-%a/%d/%b/%Y')
+
+        if reqs['cmd'] in [['enable'], ['disable']]:
+            cmd = reqs['cmd'][0]
+            xlog.info("ipv6_tunnel switch %s", cmd)
+
+            if os.path.isfile(log_path):
+                try:
+                    os.remove(log_path)
+                except Exception as e:
+                    xlog.warn("remove %s fail:%r", log_path, e)
+
+            if cmd == "enable":
+                ipv6_tunnel.enable()
+            elif cmd == "disable":
+                ipv6_tunnel.disable()
+            else:
+                xlog.warn("unknown cmd:%s", cmd)
+
+            data = '{"res":"success", "time":"%s"}' % time_now
+
+        elif reqs['cmd'] == ['get_log']:
+            if os.path.isfile(log_path):
+                with open(log_path, "r") as f:
+                    content = f.read()
+            else:
+                content = ""
+
+            status = ipv6_tunnel.state()
+
+            data = json.dumps({'status': status, 'log': content.decode("GBK"), 'time': time_now})
+
+        self.send_response_nc('text/html', data)
+
